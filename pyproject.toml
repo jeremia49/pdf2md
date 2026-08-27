@@ -1,0 +1,26 @@
+[project]
+name = "pdf2md"
+version = "0.1.0"
+description = "PDF -> Markdown pipeline: Unlimited-OCR layout parsing + vision-LLM figure descriptions"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "streamlit==1.62.0",
+    "requests==2.34.2",
+    "pymupdf==1.28.2",
+    "pillow==12.3.0",
+    "openai==3.5.0",
+    "python-dotenv==1.2.3",
+]
+
+[dependency-groups]
+dev = ["pytest==9.1.1"]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# `package = false` means pdf2md is never installed into the venv; make the repo
+# root importable so tests and `streamlit run app.py` resolve it the same way.
+pythonpath = ["."]
