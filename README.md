@@ -10,7 +10,7 @@ menjelaskan isi setiap gambar yang tidak dimengerti model OCR.
 |---|-------|-----|
 | 1 | Render halaman PDF | PyMuPDF merender tiap halaman jadi PNG sesuai DPI |
 | 2 | OCR layout | tiap halaman dikirim ke Unlimited-OCR; blok bergrounding `<\|det\|>` jadi markdown, region gambar/chart dipotong jadi PNG |
-| 3 | Deskripsi gambar | tiap potongan gambar dikirim ke vision LLM bersama caption-nya sebagai konteks |
+| 3 | Deskripsi gambar | tiap potongan gambar dikirim ke vision LLM bersama caption-nya sebagai konteks; gambar yang memuat tabel di-OCR jadi tabel markdown GFM, bukan diringkas |
 | 4 | Substitusi placeholder | `![chart](figures/...)` diganti deskripsi hasil tahap 3 |
 | 5 | Hapus header/footer | baris yang berulang di tepi tiap halaman dan nomor halaman dibuang otomatis |
 

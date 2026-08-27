@@ -184,10 +184,15 @@ def figure_block(fig: Figure, *, keep_image_link: bool) -> str:
         note = f"deskripsi gagal: {fig.error}" if fig.error else "deskripsi tidak tersedia"
         body = f"*[{note}]*"
 
+    label = f"**Deskripsi gambar ({fig.category}, halaman {fig.page}):**"
+    # A transcribed table (or any multi-line answer) must start on its own line:
+    # a `|---|` row glued after the bold label is not a table to any renderer.
+    joiner = "\n\n" if "\n" in body else " "
+
     parts: list[str] = []
     if keep_image_link:
         parts.append(f"![{fig.category}]({fig.link})")
-    parts.append(f"**Deskripsi gambar ({fig.category}, halaman {fig.page}):** {body}")
+    parts.append(f"{label}{joiner}{body}")
     return "\n\n".join(parts)
 
 

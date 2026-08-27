@@ -54,6 +54,26 @@ def test_substitute_can_drop_the_image_link():
     assert "Grafik latensi." in dropped[0]
 
 
+def test_table_description_starts_on_its_own_line():
+    # The vision prompt asks for a GFM table when the figure is one; a `|---|` row
+    # glued after the bold label renders as text, not a table.
+    table = "Tabel hasil benchmark.\n\n| model | ms |\n|---|---|\n| a | 12 |"
+    pages = ["![table](figures/a.png)"]
+
+    out, _ = md.substitute_figures(
+        pages, [fig(1, "figures/a.png", description=table, category="table")]
+    )
+    lines = out[0].splitlines()
+
+    assert "**Deskripsi gambar (table, halaman 1):**" in lines
+    assert lines[lines.index("|---|---|") - 1] == "| model | ms |"
+    # A one-line description stays inline with the label.
+    inline, _ = md.substitute_figures(
+        pages, [fig(1, "figures/a.png", description="Grafik latensi.")]
+    )
+    assert "**Deskripsi gambar (image, halaman 1):** Grafik latensi." in inline[0]
+
+
 def test_substitute_marks_failed_description_instead_of_silently_dropping():
     pages = ["![image](figures/a.png)"]
     figures = [fig(1, "figures/a.png", error="429 rate limit")]
