@@ -47,6 +47,53 @@ uv run uvicorn pdf2md.api:app --host 0.0.0.0 --port 8080     # API
 ```
 
 `uv` mengurus venv dan dependensi sendiri; tidak perlu `uv sync` manual.
+Streamlit ada di dependency group `ui`, jadi image API bisa dipasang tanpanya.
+
+## Docker
+
+`Dockerfile` mengemas **API-nya saja** (`pdf2md.api:app` di balik uvicorn); UI
+Streamlit tidak ikut. Konfigurasi seluruhnya dari environment: tidak ada `.env` di
+dalam image (`.dockerignore` memblokirnya), key dikirim saat run.
+
+```bash
+docker compose up --build                 # baca .env, terbit di :8080
+curl -F file=@paper.pdf http://127.0.0.1:8080/convert -o paper.md
+```
+
+Tanpa compose:
+
+```bash
+docker build -t pdf2md-api .
+docker run --rm -p 8080:8080 --env-file .env \
+  --read-only --tmpfs /tmp:size=2g,mode=1777 pdf2md-api
+```
+
+### Endpoint di host, bukan di container
+
+Ini kesalahan paling sering: di dalam container, `127.0.0.1` adalah container itu
+sendiri, bukan laptopmu. Kalau `OCR_BASE_URL` di `.env` menunjuk `http://127.0.0.1:8000`,
+timpa saat run:
+
+```bash
+-e OCR_BASE_URL=http://host.docker.internal:8000
+```
+
+Di Docker Desktop alias itu sudah ada. Di host Linux, aktifkan `extra_hosts` yang
+sudah disiapkan (dikomentari) di `compose.yaml`. Endpoint publik (`https://...`)
+tidak butuh apa pun.
+
+### Isi container
+
+Render halaman dan upload masuk ke `TMPDIR` (`/tmp`), lalu dihapus tiap request
+selesai. `compose.yaml` menjalankan rootfs `read_only` dengan `/tmp` sebagai tmpfs
+2 GB, jadi tidak ada yang ditulis ke layer container — halaman 300 DPI cukup besar
+dan umurnya pendek. Kalau PDF-mu besar dan `OCR_DPI` tinggi, naikkan ukuran tmpfs
+itu. Proses jalan sebagai user `pdf2md` (uid 10001), bukan root, dan `HEALTHCHECK`
+menembak `/health` (tidak butuh auth, jadi tetap jalan meski `API_KEY` diisi).
+
+Satu worker uvicorn, disengaja: tiap request sudah memakai `OCR_CONCURRENCY` +
+`VISION_CONCURRENCY` thread dan `API_MAX_CONCURRENT` sudah membatasi run paralel di
+dalam proses. Untuk kapasitas lebih, tambah replica, bukan `--workers`.
 
 ## API
 
@@ -87,24 +134,88 @@ Direktori kerja tiap request bersifat temporer dan langsung dihapus setelah resp
 disusun: Markdown dan manifest dikirim sebagai nilai, tidak ada file yang dilayani
 dari disk. Yang butuh file crop-nya harus pakai UI atau `run_pipeline` langsung.
 
-## Setelan
+## Setelan `.env`
 
-Semua nilai di `.env` (lihat `.env.example`) bisa ditimpa dari sidebar Streamlit per
-run, jadi `.env` hanya menyediakan default. Di API, `.env` dibaca sekali saat start;
-yang bisa ditimpa per request hanya `dpi`, `cleanup`, dan `keep_image_link`.
-Yang paling sering diubah:
+`cp .env.example .env`, lalu isi. Nilai model bisa ditimpa dari sidebar Streamlit
+per run; di API, `.env` dibaca **sekali saat start** dan yang bisa ditimpa per
+request hanya `dpi`, `cleanup`, `keep_image_link`.
 
-- `OCR_BASE_URL` / `OCR_MODEL` — endpoint vLLM Unlimited-OCR.
-- `VISION_BASE_URL` / `VISION_MODEL` / `VISION_API_KEY` — endpoint vision
-  OpenAI-compatible. Pakai root `/v1`; SDK menambahkan `/chat/completions`.
-- `VISION_PROMPT` — prompt deskripsi gambar. Kosongkan untuk memakai prompt bawaan.
-- `KEEP_IMAGE_LINK` — `1` menyimpan link gambar di samping deskripsi, `0` mengganti
-  placeholder dengan deskripsi saja.
-- `API_KEY` — kosong berarti API terbuka tanpa autentikasi; isi untuk mewajibkan
-  header `X-API-Key`. `API_MAX_UPLOAD_MB` dan `API_MAX_CONCURRENT` membatasi ukuran
-  upload dan jumlah run berbarengan.
+Yang wajib diisi cuma tiga: `OCR_BASE_URL`, `VISION_BASE_URL`, `VISION_API_KEY`.
+Sisanya punya default yang wajar. Setiap baris kosong (`OCR_MODEL=`) jatuh ke
+default, bukan jadi string kosong, dan angka yang tidak bisa diparsing juga jatuh
+ke default alih-alih membuat server gagal start.
 
-`.env` berisi API key dan sudah masuk `.gitignore`.
+### Stage 1 — Unlimited-OCR
+
+| Variabel | Default | Isi |
+|----------|---------|-----|
+| `OCR_BASE_URL` | `http://127.0.0.1:8000` | Root endpoint vLLM; klien menambahkan `/v1/chat/completions` sendiri. **Tanpa** `/v1`. |
+| `OCR_API_KEY` | kosong | Hanya kalau vLLM-mu dijalankan dengan `--api-key`. |
+| `OCR_MODEL` | `baidu/Unlimited-OCR` | Harus sama dengan nama model yang diserve. |
+| `OCR_DPI` | `300` | Resolusi render halaman. Turunkan untuk hemat waktu/token, naikkan untuk scan buruk. |
+| `OCR_MAX_TOKENS` | `8192` | Lihat catatan di bawah; jangan disetel ke `max_model_len`. |
+| `OCR_TIMEOUT` | `1800` | Detik per halaman. |
+| `OCR_CONCURRENCY` | `4` | Halaman diproses sekaligus. Batasi sesuai kapasitas GPU-mu. |
+| `OCR_RETRIES` | `4` | Percobaan per halaman; error 4xx tidak diulang. |
+| `OCR_FIGURE_PAD` | `6` | Piksel margin saat memotong gambar. |
+
+### Stage 2 — vision LLM
+
+| Variabel | Default | Isi |
+|----------|---------|-----|
+| `VISION_BASE_URL` | `https://api.openai.com/v1` | Root `/v1`; SDK menambahkan `/chat/completions`. **Pakai** `/v1` di sini — beda dari OCR. |
+| `VISION_API_KEY` | kosong | Key endpoint vision. |
+| `VISION_MODEL` | `gpt-4o` | Model apa pun yang menerima input gambar. |
+| `VISION_TIMEOUT` | `300` | Detik per gambar. |
+| `VISION_TEMPERATURE` | `0.2` | Rendah supaya deskripsi tidak mengarang. |
+| `VISION_MAX_TOKENS` | `600` | Naikkan kalau gambarmu banyak memuat tabel. |
+| `VISION_CONCURRENCY` | `4` | Gambar dideskripsikan sekaligus; perhatikan rate limit. |
+| `VISION_RETRIES` | `3` | Percobaan per gambar. |
+| `VISION_PROMPT` | prompt bawaan (Indonesia) | Kosongkan untuk memakai bawaan. |
+
+### Stage 4 — header/footer dan output
+
+| Variabel | Default | Isi |
+|----------|---------|-----|
+| `CLEANUP_ENABLED` | `1` | Matikan (`0`) kalau pembersihan memakan isi dokumen. |
+| `CLEANUP_MIN_RATIO` | `0.6` | Fraksi halaman yang harus memuat satu baris agar dianggap chrome. |
+| `CLEANUP_MIN_PAGES` | `3` | Dokumen lebih pendek dari ini tidak dibersihkan secara statistik. |
+| `CLEANUP_ZONE_LINES` | `3` | Berapa baris teratas/terbawah tiap halaman yang boleh dibuang. |
+| `CLEANUP_DROP_PAGE_NUMBERS` | `1` | Buang nomor halaman walau tidak berulang verbatim. |
+| `KEEP_IMAGE_LINK` | `1` | `1` menyimpan link gambar di samping deskripsi, `0` mengganti placeholder dengan deskripsi saja. |
+
+### HTTP API
+
+| Variabel | Default | Isi |
+|----------|---------|-----|
+| `API_KEY` | kosong | **Kosong berarti server terbuka tanpa autentikasi.** Isi untuk mewajibkan header `X-API-Key`. |
+| `API_MAX_UPLOAD_MB` | `50` | Upload lebih besar ditolak `413` sambil dibaca, bukan setelah. |
+| `API_MAX_CONCURRENT` | `2` | PDF diproses sekaligus; sisanya mengantre. |
+
+Nilai bool menerima `1/0`, `true/false`, `yes/no`, `on/off`.
+
+`.env` berisi API key: sudah masuk `.gitignore` dan `.dockerignore`, jadi tidak
+pernah ikut ke image. Di container, isinya masuk lewat `--env-file` / `env_file`,
+bukan lewat file di dalam image.
+
+### Contoh minimal
+
+```dotenv
+# OCR jalan di host yang sama
+OCR_BASE_URL=http://127.0.0.1:8000
+OCR_MODEL=baidu/Unlimited-OCR
+
+# Vision di layanan OpenAI-compatible
+VISION_BASE_URL=https://api.openai.com/v1
+VISION_API_KEY=sk-...
+VISION_MODEL=gpt-4o
+
+# Server terbuka? isi ini.
+API_KEY=ganti-aku
+```
+
+Di Docker, `OCR_BASE_URL=http://127.0.0.1:8000` menunjuk ke container itu sendiri;
+pakai `http://host.docker.internal:8000`. Lihat bagian Docker di atas.
 
 ### Catatan penting soal `OCR_MAX_TOKENS`
 

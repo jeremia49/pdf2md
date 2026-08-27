@@ -1,0 +1,33 @@
+# docker compose up --build
+#
+# `.env` is read two ways on purpose:
+#   env_file  -> the values land in the container's environment, which is where
+#                Settings.from_env() reads them.
+#   No bind mount of .env: the file never needs to be inside the image or the
+#   container filesystem, so a leaked container layer cannot carry the keys.
+services:
+  api:
+    build: .
+    image: pdf2md-api
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    environment:
+      # Inside the container, 127.0.0.1 is the container itself. An OCR endpoint
+      # running on the Docker host must be addressed as host.docker.internal;
+      # uncomment if OCR_BASE_URL in .env points at localhost.
+      # OCR_BASE_URL: http://host.docker.internal:8000
+      TMPDIR: /tmp
+    # Page renders at 300 DPI are large and short-lived; keeping them in RAM avoids
+    # writing every upload to the container's writable layer.
+    tmpfs:
+      - /tmp:size=2g,mode=1777
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    # Uncomment when the OCR endpoint runs on the Docker host itself (Linux hosts
+    # need this alias; Docker Desktop provides it already).
+    # extra_hosts:
+    #   - "host.docker.internal:host-gateway"

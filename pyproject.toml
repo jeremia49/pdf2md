@@ -5,7 +5,6 @@ description = "PDF -> Markdown pipeline: Unlimited-OCR layout parsing + vision-L
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "streamlit==1.62.0",
     "requests==2.34.2",
     "pymupdf==1.28.2",
     "pillow==12.3.0",
@@ -18,11 +17,16 @@ dependencies = [
 ]
 
 [dependency-groups]
+# Streamlit is only needed by `app.py`. Keeping it out of `dependencies` lets the
+# API container install with `--no-default-groups` and skip streamlit + pandas +
+# pyarrow entirely; `default-groups` below keeps the local workflow unchanged.
+ui = ["streamlit==1.62.0"]
 # httpx backs fastapi.testclient.
 dev = ["pytest==9.1.1", "httpx==0.28.1"]
 
 [tool.uv]
 package = false
+default-groups = ["dev", "ui"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
