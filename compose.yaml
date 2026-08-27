@@ -31,9 +31,3 @@ services:
     # need this alias; Docker Desktop provides it already).
     # extra_hosts:
     #   - "host.docker.internal:host-gateway"
-    networks:
-      - shared-net
-
-networks:
-  shared-net:
-    external: true
