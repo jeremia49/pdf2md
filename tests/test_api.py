@@ -7,6 +7,7 @@ shaping and error mapping without rendering a PDF.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from urllib.parse import unquote
 
@@ -15,7 +16,7 @@ import pytest
 from pdf2md import api as api_mod
 from pdf2md.markdown import CleanupReport
 from pdf2md.ocr import Figure
-from pdf2md.pipeline import PipelineResult
+from pdf2md.pipeline import PipelineResult, Progress
 
 fastapi_testclient = pytest.importorskip("fastapi.testclient")
 TestClient = fastapi_testclient.TestClient
@@ -236,3 +237,135 @@ def test_open_server_needs_no_header(client):
     c, _ = client
     assert not api_mod.API.api_key, "test .env must not set API_KEY"
     assert _post(c).status_code == 200
+
+# --- /convert/stream ---------------------------------------------------------
+
+
+def _post_stream(client, *, name="paper.pdf", data=PDF, **params):
+    return client.post(
+        "/convert/stream", files={"file": (name, data, "application/pdf")}, params=params
+    )
+
+
+def _events(response) -> list[dict]:
+    return [json.loads(line) for line in response.text.splitlines() if line.strip()]
+
+
+@pytest.fixture
+def stream_client(monkeypatch):
+    """Client with the streaming pipeline stubbed. Yields (client, call log)."""
+    calls: list[tuple[bytes, str, object]] = []
+
+    def fake_convert(pdf_bytes, name, settings, ticks):
+        calls.append((pdf_bytes, name, settings))
+        ticks.put(Progress("render", "Render halaman PDF", 1, 1, "2 halaman"))
+        ticks.put(Progress("ocr", "OCR layout (Unlimited-OCR)", 1, 2, "hal 1"))
+        ticks.put(Progress("ocr", "OCR layout (Unlimited-OCR)", 2, 2, "hal 2"))
+        ticks.put(("done", _result()))
+
+    monkeypatch.setattr(api_mod, "_convert_streaming", fake_convert)
+    with TestClient(api_mod.app) as c:
+        yield c, calls
+
+
+def test_stream_emits_progress_then_the_whole_markdown(stream_client):
+    c, calls = stream_client
+    r = _post_stream(c)
+
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("application/x-ndjson")
+    assert r.headers["x-accel-buffering"] == "no"
+
+    events = _events(r)
+    progress = [e for e in events if e["type"] == "progress"]
+    assert len(progress) == 3
+    # Every tick carries the per-stage snapshot the Streamlit UI paints.
+    last = progress[-1]
+    assert last["stage"] == "ocr"
+    assert last["stages"]["render"]["status"] == "done"
+    assert last["stages"]["ocr"]["counter"] == "2/2"
+    assert last["stages"]["vision"]["status"] == "pending"
+    assert 0 < progress[0]["overall"] < 1
+
+    result = events[-1]
+    assert result["type"] == "result"
+    assert result["markdown"] == "# Judul\n\nIsi halaman 1."
+    assert result["filename"] == "paper.md"
+    assert result["page_count"] == 2
+    assert result["figures"][0]["description"] == "Grafik latensi kernel, tren datar."
+    assert calls[0][0] == PDF
+
+
+def test_stream_overall_is_monotonic(stream_client):
+    c, _ = stream_client
+    overalls = [e["overall"] for e in _events(_post_stream(c)) if e["type"] == "progress"]
+    assert overalls == sorted(overalls)
+
+
+def test_stream_query_overrides_reach_the_pipeline_settings(stream_client):
+    c, calls = stream_client
+    r = _post_stream(c, dpi=150, cleanup="false", keep_image_link="true")
+
+    assert r.status_code == 200
+    settings = calls[0][2]
+    assert settings.ocr.dpi == 150
+    assert settings.cleanup.enabled is False
+    assert settings.keep_image_link is True
+
+
+def test_stream_error_is_a_terminal_event_with_the_one_shot_status(stream_client, monkeypatch):
+    c, _ = stream_client
+    monkeypatch.setattr(
+        api_mod,
+        "_convert_streaming",
+        lambda *a: a[3].put(("error", {"status": 502, "detail": "Semua halaman gagal di-OCR."})),
+    )
+    r = _post_stream(c)
+
+    assert r.status_code == 200  # the feed itself started fine
+    events = _events(r)
+    assert events[-1] == {
+        "type": "error",
+        "status": 502,
+        "detail": "Semua halaman gagal di-OCR.",
+    }
+
+
+def test_stream_unexpected_failure_is_a_500_event(stream_client, monkeypatch):
+    c, _ = stream_client
+    # Drop the fixture's stub: the real _convert_streaming must wrap whatever
+    # the broken run_pipeline raises.
+    monkeypatch.undo()
+    monkeypatch.setattr(
+        api_mod,
+        "run_pipeline",
+        lambda *a, **k: (_ for _ in ()).throw(OSError("disk penuh")),
+    )
+    r = _post_stream(c)
+
+    events = _events(r)
+    assert events[-1]["type"] == "error"
+    assert events[-1]["status"] == 500
+    assert "disk penuh" in events[-1]["detail"]
+
+
+def test_stream_upload_validation_happens_before_the_feed(stream_client):
+    c, calls = stream_client
+    assert _post_stream(c, data=b"").status_code == 400
+    assert _post_stream(c, data=b"bukan pdf").status_code == 415
+    assert not calls  # validation failures never reach the pipeline
+
+
+def test_stream_api_key_is_enforced_only_when_configured(stream_client, monkeypatch):
+    c, calls = stream_client
+    monkeypatch.setattr(api_mod, "API", api_mod.ApiSettings(api_key="rahasia"))
+
+    assert _post_stream(c).status_code == 401
+    assert not calls
+
+    ok = c.post(
+        "/convert/stream",
+        files={"file": ("paper.pdf", PDF, "application/pdf")},
+        headers={"X-API-Key": "rahasia"},
+    )
+    assert ok.status_code == 200

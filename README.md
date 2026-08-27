@@ -149,6 +149,60 @@ Kode status: `400` PDF kosong/tidak bisa dirender, `413` melewati
 `API_MAX_UPLOAD_MB`, `415` bukan PDF, `401` API key salah, `502` semua halaman gagal
 di-OCR (endpoint OCR yang bermasalah, bukan filenya).
 
+### `POST /convert/stream`
+
+Sama seperti `/convert` (body, override `dpi`/`cleanup`/`keep_image_link`, header
+auth), tapi menjawab dengan **stream NDJSON** (`application/x-ndjson`): satu objek
+JSON per baris, sehingga pemanggil bisa menampilkan progres hidup seperti UI
+Streamlit, lalu menerima Markdown lengkap di akhir.
+
+```bash
+curl -N -F file=@paper.pdf http://127.0.0.1:8080/convert/stream
+```
+
+Event `progress` dikirim tiap tick pipeline:
+
+```json
+{"type":"progress","stage":"ocr","label":"OCR layout (Unlimited-OCR)","done":7,"total":14,"message":"hal 7","overall":0.35,"active":"OCR layout (Unlimited-OCR) + Deskripsi gambar (vision LLM)","stages":{"render":{"label":"Render halaman PDF","status":"done","done":14,"total":14,"counter":"14/14","message":""},"ocr":{"label":"OCR layout (Unlimited-OCR)","status":"running","done":7,"total":14,"counter":"7/14+","message":"hal 7"},"vision":{"label":"Deskripsi gambar (vision LLM)","status":"pending"},...}}
+```
+
+`overall` monoton naik (0..1), dan `stages` adalah snapshot per tahap persis yang
+digambar UI: `status` (`pending`/`running`/`done`), `counter` (`"7/14"`; akhiran
+`+` menandai total vision yang masih bisa bertambah), dan `message`. Tiga tahap
+pertama adalah `render`, `ocr`, `vision`, lalu `substitute` dan `cleanup`.
+
+Feed ditutup satu event terminal:
+
+- `{"type":"result", ...}` — payload yang sama dengan `/convert?format=json`:
+  `markdown` lengkap, `filename`, counter run, dan manifest `figures[]`.
+- `{"type":"error","status":...,"detail":"..."}` — `status` adalah kode yang akan
+  dikembalikan `/convert` (`400` PDF tak bisa dirender, `502` semua halaman gagal
+  di-OCR, `500` kesalahan tak terduga). HTTP status feed itu sendiri tetap `200`
+  karena stream sudah dimulai; kegagalan validasi upload (`400`/`413`/`415`/`401`)
+  terjadi sebelum feed ada, jadi tetap berupa status HTTP biasa.
+
+Di belakang proxy (nginx dsb.), header `X-Accel-Buffering: no` sudah disetel agar
+respons tidak dibuffer; di sisi klien pakai `curl -N` atau pembaca baris biasa.
+
+Klien Python minimal:
+
+```python
+import json
+
+import httpx
+
+with httpx.stream("POST", "http://127.0.0.1:8080/convert/stream",
+                  files={"file": open("paper.pdf", "rb")}, timeout=None) as r:
+    for line in r.iter_lines():
+        event = json.loads(line)
+        if event["type"] == "progress":
+            print(f"\r{event['overall']:.0%} — {event['active']}", end="")
+        elif event["type"] == "result":
+            open(event["filename"], "w").write(event["markdown"])
+        else:
+            print(f"\ngagal ({event['status']}): {event['detail']}")
+```
+
 Endpoint dan API key model dibaca sekali dari `.env` saat start, jadi tidak ada
 setelan per request selain tiga override di atas. Satu proses memproses
 `API_MAX_CONCURRENT` PDF sekaligus; sisanya mengantre, supaya request berbarengan

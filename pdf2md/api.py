@@ -5,6 +5,10 @@ never needs the UI:
 
     curl -F file=@paper.pdf http://127.0.0.1:8080/convert -o paper.md
 
+`POST /convert/stream` answers the same upload with a live NDJSON feed: one JSON
+object per line, a `progress` event per pipeline tick (the same per-stage view the
+Streamlit app paints), then a single terminal event carrying the whole Markdown.
+
 Design notes:
 
 * Settings come from `.env` once at import (`Settings.from_env()`), because a
@@ -18,27 +22,45 @@ Design notes:
 * The work directory is temporary and removed once the response is built: the
   Markdown and the figure manifest are returned by value, nothing is served
   from disk afterwards.
+* The stream endpoint relays progress through a thread-safe queue instead of an
+  async queue: the capacity limiter that bounds concurrent runs is contextvar
+  state, and anyio's `task_group` + `to_thread` would only see a copied context.
+  Moving the limiter through `start_blocking_portal` would fix that but cost an
+  extra thread-per-process dance; a `queue.Queue` plus a worker thread is simpler
+  and just as correct.
 """
 
 from __future__ import annotations
 
+import asyncio
+import json
+import queue
 import re
 import secrets
 import shutil
 import tempfile
+import threading
+from collections.abc import AsyncIterator
 from dataclasses import replace
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 from urllib.parse import quote
 
 import anyio
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, UploadFile
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 from .config import ApiSettings, Settings, load_env
 from .ocr import Figure
-from .pipeline import PipelineResult, run_pipeline
+from .pipeline import (
+    CONCURRENT_STAGES,
+    STAGE_LABELS,
+    PipelineResult,
+    Progress,
+    ProgressTracker,
+    run_pipeline,
+)
 
 load_env()
 API = ApiSettings.from_env()
@@ -64,6 +86,9 @@ app = FastAPI(
 # Bound concurrent pipeline runs. anyio's limiter works with the threadpool call
 # below, so a queued request holds no worker thread while it waits.
 _slots = anyio.CapacityLimiter(API.max_concurrent)
+# The stream endpoint runs on plain threads, where anyio's limiter release would
+# mix thread- and task-owner bookkeeping; a plain semaphore is its equivalent.
+_stream_slots = threading.Semaphore(API.max_concurrent)
 
 
 def require_key(x_api_key: Annotated[str | None, Header()] = None) -> None:
@@ -173,6 +198,137 @@ def _convert(pdf_bytes: bytes, name: str, settings: Settings) -> PipelineResult:
         shutil.rmtree(workdir, ignore_errors=True)
 
 
+def _convert_out(result: PipelineResult, md_name: str) -> ConvertOut:
+    """The JSON shape of a finished run, shared by `/convert` and the stream."""
+    return ConvertOut(
+        filename=md_name,
+        markdown=result.markdown,
+        page_count=result.page_count,
+        figure_count=len(result.figures),
+        described=result.described,
+        substituted=result.substituted,
+        chrome_removed=result.cleanup.removed_count,
+        page_failures=result.failures,
+        figure_errors=result.figure_errors,
+        figures=[FigureOut.of(f) for f in result.figures],
+    )
+
+
+def _outcome(status: int, message: str) -> dict[str, Any]:
+    """Terminal error event of a `/convert/stream` feed."""
+    return {"status": status, "detail": message}
+
+
+def _convert_streaming(
+    pdf_bytes: bytes, name: str, settings: Settings, ticks: queue.Queue
+) -> None:
+    """`_convert` plus progress: runs on a plain thread and reports via `ticks`.
+
+    The terminal item is always `("done", PipelineResult)` or
+    `("error", {status, detail})`, so the async reader can stop after one
+    terminal event without waiting for the thread to be reaped.
+    """
+    workdir = Path(tempfile.mkdtemp(prefix="pdf2md_api_"))
+    try:
+        pdf = workdir / name
+        pdf.write_bytes(pdf_bytes)
+        result = run_pipeline(pdf, workdir, settings, progress=ticks.put)
+        ticks.put(("done", result))
+    except ValueError as exc:
+        ticks.put(("error", _outcome(400, str(exc))))
+    except RuntimeError as exc:
+        ticks.put(("error", _outcome(502, str(exc))))
+    except Exception as exc:  # unexpected: still terminate the feed cleanly
+        ticks.put(("error", _outcome(500, f"Pipeline gagal: {exc}")))
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def _stream_worker(
+    pdf_bytes: bytes, name: str, settings: Settings, ticks: queue.Queue
+) -> None:
+    """Hold a concurrency slot for the whole run, then convert with progress."""
+    _stream_slots.acquire()
+    try:
+        _convert_streaming(pdf_bytes, name, settings, ticks)
+    finally:
+        _stream_slots.release()
+
+
+def _stages_view(tracker: ProgressTracker, tick: Progress) -> dict[str, Any]:
+    """One progress event: the raw tick plus the per-stage snapshot the Streamlit
+    app paints as rows."""
+    stages: dict[str, Any] = {}
+    for key, label in STAGE_LABELS.items():
+        seen = tracker.latest.get(key)
+        if seen is None:
+            stages[key] = {"label": label, "status": "pending"}
+            continue
+        counter = f"{seen.done}/{seen.total}" if seen.total else "—"
+        if key in CONCURRENT_STAGES and seen.total and not tracker.is_done(key):
+            # A vision total grows while figures are still being found; mark the
+            # denominator as provisional, like the Streamlit "+" suffix.
+            counter += "+"
+        stages[key] = {
+            "label": label,
+            "status": "done" if tracker.is_done(key) else "running",
+            "done": seen.done,
+            "total": seen.total,
+            "counter": counter,
+            "message": seen.message,
+        }
+    active = " + ".join(
+        STAGE_LABELS[k]
+        for k in ("ocr", "vision")
+        if tracker.started(k) and not tracker.is_done(k)
+    )
+    return {
+        "type": "progress",
+        "stage": tick.stage,
+        "label": tick.label,
+        "done": tick.done,
+        "total": tick.total,
+        "message": tick.message,
+        "overall": round(tracker.overall, 4),
+        "active": active or tick.label,
+        "stages": stages,
+    }
+
+
+async def _stream_run(pdf_bytes: bytes, name: str, settings: Settings) -> AsyncIterator[str]:
+    """Drain the worker's queue into an NDJSON feed.
+
+    The slot is acquired inside the worker thread (see the module docstring), so
+    a queued request parks one executor thread while it waits in `queue.get`.
+    """
+    ticks: queue.Queue = queue.Queue()
+    threading.Thread(
+        target=_stream_worker, args=(pdf_bytes, name, settings, ticks), daemon=True
+    ).start()
+    tracker = ProgressTracker()
+    loop = asyncio.get_running_loop()
+    md_name = f"{Path(name).stem}.md"
+    while True:
+        # run_in_executor keeps the blocking queue.get off the event loop. On a
+        # client disconnect the generator is abandoned and one executor thread
+        # stays parked in get() until the run ends -- which the daemon worker
+        # guarantees, removing its workdir in its own finally.
+        item = await loop.run_in_executor(None, ticks.get)
+        if isinstance(item, Progress):
+            tracker.update(item)
+            yield json.dumps(_stages_view(tracker, item), ensure_ascii=False) + "\n"
+            continue
+        kind, payload = item
+        if kind == "error":
+            yield json.dumps({"type": "error", **payload}, ensure_ascii=False) + "\n"
+            return
+        yield json.dumps(
+            {"type": "result"} | _convert_out(payload, md_name).model_dump(),
+            ensure_ascii=False,
+        ) + "\n"
+        return
+
+
 @app.get("/health")
 def health() -> dict:
     """Liveness plus the effective model config. Never echoes an API key."""
@@ -231,20 +387,7 @@ async def convert(
 
     md_name = f"{Path(name).stem}.md"
     if format == "json":
-        return JSONResponse(
-            ConvertOut(
-                filename=md_name,
-                markdown=result.markdown,
-                page_count=result.page_count,
-                figure_count=len(result.figures),
-                described=result.described,
-                substituted=result.substituted,
-                chrome_removed=result.cleanup.removed_count,
-                page_failures=result.failures,
-                figure_errors=result.figure_errors,
-                figures=[FigureOut.of(f) for f in result.figures],
-            ).model_dump()
-        )
+        return JSONResponse(_convert_out(result, md_name).model_dump())
 
     return Response(
         content=result.markdown.encode("utf-8"),
@@ -258,4 +401,38 @@ async def convert(
             "X-Pdf2md-Chrome-Removed": str(result.cleanup.removed_count),
             "X-Pdf2md-Page-Failures": str(len(result.failures)),
         },
+    )
+
+
+@app.post(
+    "/convert/stream",
+    dependencies=[Depends(require_key)],
+    response_model=None,
+    response_class=StreamingResponse,
+    responses={200: {"content": {"application/x-ndjson": {"schema": {"type": "string"}}}}},
+)
+async def convert_stream(
+    file: Annotated[UploadFile, File(description="PDF yang mau dikonversi")],
+    dpi: Annotated[int | None, Query(ge=72, le=600)] = None,
+    cleanup: Annotated[bool | None, Query()] = None,
+    keep_image_link: Annotated[bool | None, Query()] = None,
+) -> StreamingResponse:
+    """PDF in, live progress out, Markdown last.
+
+    Streams NDJSON: a `progress` event per pipeline tick (`stage`, `done/total`,
+    `overall` 0..1, and `stages` — the per-stage snapshot the Streamlit UI
+    shows), then one terminal event. On success that is `type=result` with the
+    whole Markdown plus the figure manifest, the same payload as
+    `/convert?format=json`. On failure it is `type=error` with the HTTP
+    `status` the one-shot endpoint would have returned; upload validation keeps
+    its plain status codes, since no feed exists yet.
+    """
+    pdf_bytes = await _read_capped(file)
+    name = _safe_pdf_name(file.filename)
+    settings = _settings_for(dpi, cleanup, keep_image_link)
+    return StreamingResponse(
+        _stream_run(pdf_bytes, name, settings),
+        media_type="application/x-ndjson",
+        # The feed is live; buffering proxies must not sit on it.
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
