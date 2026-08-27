@@ -1,6 +1,6 @@
 # pdf2md
 
-PDF → Markdown siap copy. Menggabungkan dua model yang tadinya terpisah —
+Menggabungkan dua model terpisah —
 Unlimited-OCR untuk membaca layout dokumen, dan sebuah vision LLM untuk menjelaskan
 isi setiap gambar yang tidak dimengerti model OCR.
 
