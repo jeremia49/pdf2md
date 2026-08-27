@@ -14,10 +14,15 @@ services:
     env_file:
       - .env
     environment:
-      # Inside the container, 127.0.0.1 is the container itself. An OCR endpoint
-      # running on the Docker host must be addressed as host.docker.internal;
-      # uncomment if OCR_BASE_URL in .env points at localhost.
-      # OCR_BASE_URL: http://host.docker.internal:8000
+      # Service-to-service, not host-to-service. `unlimited-ocr` is the service
+      # name in ../unlimited-ocr-container/docker-compose.yml, and 8000 is the
+      # port INSIDE that container -- the published 127.0.0.1:5000 mapping is for
+      # host tooling only and is not reachable from here.
+      #
+      # Overrides whatever OCR_BASE_URL sits in .env: `environment` wins over
+      # `env_file` in compose. Keep .env's value pointing at the host endpoint so
+      # the Streamlit UI and ocr_client.py keep working outside Docker.
+      OCR_BASE_URL: http://unlimited-ocr:8000
       TMPDIR: /tmp
     # Page renders at 300 DPI are large and short-lived; keeping them in RAM avoids
     # writing every upload to the container's writable layer.
@@ -27,7 +32,19 @@ services:
     security_opt:
       - no-new-privileges:true
     restart: unless-stopped
-    # Uncomment when the OCR endpoint runs on the Docker host itself (Linux hosts
-    # need this alias; Docker Desktop provides it already).
-    # extra_hosts:
-    #   - "host.docker.internal:host-gateway"
+    networks:
+      - ocr-net
+    # Nothing here waits for the OCR container: vLLM needs 10+ minutes to load
+    # weights, and the API only calls OCR per request, so a slow neighbour costs a
+    # failed request, not a failed boot.
+
+# Created by ../unlimited-ocr-container/docker-compose.yml (`name: ocr-net`).
+# `external: true` means compose attaches to it and never creates or removes it,
+# so bring the OCR stack up first:
+#
+#   docker compose -f ../unlimited-ocr-container/docker-compose.yml up -d
+#   docker compose up --build
+networks:
+  ocr-net:
+    name: ocr-net
+    external: true

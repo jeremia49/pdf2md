@@ -55,32 +55,56 @@ Streamlit ada di dependency group `ui`, jadi image API bisa dipasang tanpanya.
 Streamlit tidak ikut. Konfigurasi seluruhnya dari environment: tidak ada `.env` di
 dalam image (`.dockerignore` memblokirnya), key dikirim saat run.
 
+### Dua stack: pdf2md + unlimited-ocr-container
+
+OCR jalan di compose project sendiri (`../unlimited-ocr-container`). Keduanya
+disambung lewat network bernama `ocr-net`: project OCR yang membuatnya, pdf2md
+menempel sebagai `external: true`. Jadi OCR harus naik lebih dulu, kalau tidak
+compose pdf2md gagal dengan `network ocr-net declared as external, but could not
+be found`.
+
 ```bash
+docker compose -f ../unlimited-ocr-container/docker-compose.yml up -d --build
 docker compose up --build                 # baca .env, terbit di :8080
 curl -F file=@paper.pdf http://127.0.0.1:8080/convert -o paper.md
 ```
+
+Di dalam network itu alamat OCR adalah **`http://unlimited-ocr:8000`** — nama
+service, dan port di dalam container. Port `127.0.0.1:5000` yang dipublish itu
+cuma untuk host (`ocr_client.py`, `curl`), tidak bisa dipakai dari container lain.
+`compose.yaml` sudah menyetel `OCR_BASE_URL` ke alamat itu di blok `environment`,
+yang menang atas `env_file`, jadi `.env` tetap boleh menyimpan alamat host
+(`http://127.0.0.1:5000`) untuk pemakaian di luar Docker.
+
+Kalau vLLM dijalankan dengan auth, `VLLM_API_KEY` di stack OCR dan `OCR_API_KEY`
+di `.env` pdf2md harus sama. Keduanya kosong berarti tanpa auth — aman hanya
+karena port OCR tidak dipublish ke luar loopback.
+
+Tidak ada `depends_on` ke OCR: vLLM butuh belasan menit memuat weight, sementara
+pdf2md baru memanggil OCR saat ada request. Kalau OCR belum siap, yang gagal satu
+request, bukan boot API-nya. Cek kesiapan: `curl http://127.0.0.1:5000/health`.
 
 Tanpa compose:
 
 ```bash
 docker build -t pdf2md-api .
 docker run --rm -p 8080:8080 --env-file .env \
+  --network ocr-net -e OCR_BASE_URL=http://unlimited-ocr:8000 \
   --read-only --tmpfs /tmp:size=2g,mode=1777 pdf2md-api
 ```
 
-### Endpoint di host, bukan di container
+### Endpoint OCR di host, bukan di container
 
-Ini kesalahan paling sering: di dalam container, `127.0.0.1` adalah container itu
-sendiri, bukan laptopmu. Kalau `OCR_BASE_URL` di `.env` menunjuk `http://127.0.0.1:8000`,
-timpa saat run:
+Kalau OCR-nya kamu jalankan langsung di host (bukan container), `127.0.0.1` di
+dalam container adalah container itu sendiri, bukan laptopmu. Timpa saat run:
 
 ```bash
--e OCR_BASE_URL=http://host.docker.internal:8000
+-e OCR_BASE_URL=http://host.docker.internal:5000
 ```
 
-Di Docker Desktop alias itu sudah ada. Di host Linux, aktifkan `extra_hosts` yang
-sudah disiapkan (dikomentari) di `compose.yaml`. Endpoint publik (`https://...`)
-tidak butuh apa pun.
+Di Docker Desktop alias itu sudah ada; di host Linux tambahkan
+`extra_hosts: ["host.docker.internal:host-gateway"]`. Endpoint publik
+(`https://...`) tidak butuh apa pun.
 
 ### Isi container
 
@@ -149,8 +173,8 @@ ke default alih-alih membuat server gagal start.
 
 | Variabel | Default | Isi |
 |----------|---------|-----|
-| `OCR_BASE_URL` | `http://127.0.0.1:8000` | Root endpoint vLLM; klien menambahkan `/v1/chat/completions` sendiri. **Tanpa** `/v1`. |
-| `OCR_API_KEY` | kosong | Hanya kalau vLLM-mu dijalankan dengan `--api-key`. |
+| `OCR_BASE_URL` | `http://127.0.0.1:8000` | Root endpoint vLLM; klien menambahkan `/v1/chat/completions` sendiri. **Tanpa** `/v1`. Di host pakai `http://127.0.0.1:5000` (port yang dipublish stack OCR); di compose sudah ditimpa jadi `http://unlimited-ocr:8000`. |
+| `OCR_API_KEY` | kosong | Harus sama dengan `VLLM_API_KEY` di stack OCR. Kosong di dua sisi = tanpa auth. |
 | `OCR_MODEL` | `baidu/Unlimited-OCR` | Harus sama dengan nama model yang diserve. |
 | `OCR_DPI` | `300` | Resolusi render halaman. Turunkan untuk hemat waktu/token, naikkan untuk scan buruk. |
 | `OCR_MAX_TOKENS` | `8192` | Lihat catatan di bawah; jangan disetel ke `max_model_len`. |
@@ -201,8 +225,8 @@ bukan lewat file di dalam image.
 ### Contoh minimal
 
 ```dotenv
-# OCR jalan di host yang sama
-OCR_BASE_URL=http://127.0.0.1:8000
+# OCR dari host: port yang dipublish unlimited-ocr-container
+OCR_BASE_URL=http://127.0.0.1:5000
 OCR_MODEL=baidu/Unlimited-OCR
 
 # Vision di layanan OpenAI-compatible
@@ -214,8 +238,9 @@ VISION_MODEL=gpt-4o
 API_KEY=ganti-aku
 ```
 
-Di Docker, `OCR_BASE_URL=http://127.0.0.1:8000` menunjuk ke container itu sendiri;
-pakai `http://host.docker.internal:8000`. Lihat bagian Docker di atas.
+Di bawah `docker compose up`, `compose.yaml` menimpa `OCR_BASE_URL` jadi
+`http://unlimited-ocr:8000` lewat `ocr-net`, jadi baris di atas tidak perlu
+diubah. Lihat bagian Docker di atas.
 
 ### Catatan penting soal `OCR_MAX_TOKENS`
 
