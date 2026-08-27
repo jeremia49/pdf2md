@@ -2,6 +2,10 @@
 
 Settings are dataclasses rather than module globals so each Streamlit rerun builds
 a fresh config; nothing process-wide leaks between pipeline runs.
+
+`ApiSettings` is deliberately *not* part of `Settings`: it configures the HTTP
+server process (auth, upload cap, run slots), not a single pipeline run, and is
+read once at startup instead of per request.
 """
 
 from __future__ import annotations
@@ -159,6 +163,28 @@ class CleanupSettings:
             min_pages=_env_int("CLEANUP_MIN_PAGES", d.min_pages),
             zone_lines=_env_int("CLEANUP_ZONE_LINES", d.zone_lines),
             drop_page_numbers=_env_bool("CLEANUP_DROP_PAGE_NUMBERS", d.drop_page_numbers),
+        )
+
+
+@dataclass(slots=True)
+class ApiSettings:
+    """HTTP surface in `pdf2md/api.py`. Process-wide, read once at import."""
+
+    # Empty means no authentication: every caller may convert. Set API_KEY to
+    # require the `X-API-Key` header.
+    api_key: str = ""
+    max_upload_mb: int = 50
+    # Each run already fans out to OCR_CONCURRENCY + VISION_CONCURRENCY threads,
+    # so concurrent requests are queued rather than multiplied onto the endpoints.
+    max_concurrent: int = 2
+
+    @classmethod
+    def from_env(cls) -> "ApiSettings":
+        d = cls()
+        return cls(
+            api_key=_env("API_KEY", d.api_key),
+            max_upload_mb=_env_int("API_MAX_UPLOAD_MB", d.max_upload_mb),
+            max_concurrent=max(1, _env_int("API_MAX_CONCURRENT", d.max_concurrent)),
         )
 
 
