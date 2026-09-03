@@ -119,14 +119,12 @@ Satu worker uvicorn, disengaja: tiap request sudah memakai `OCR_CONCURRENCY` +
 `VISION_CONCURRENCY` thread dan `API_MAX_CONCURRENT` sudah membatasi run paralel di
 dalam proses. Untuk kapasitas lebih, tambah replica, bukan `--workers`.
 
-## API
+Ada dua varian endpoint:
 
-```bash
-curl -F file=@paper.pdf http://127.0.0.1:8080/convert -o paper.md
-```
-
-Itu saja untuk kasus dasar: kirim PDF, dapat `.md`. Dokumentasi interaktif ada di
-`/docs`, dan `/health` menampilkan konfigurasi model yang sedang aktif (tanpa API key).
+| Endpoint | Deskripsi gambar | Kegunaan |
+|----------|------------------|----------|
+| `/convert`, `/convert/stream` | ✅ Vision LLM | Full pipeline dengan deskripsi gambar |
+| `/convert/ocr`, `/convert/ocr/stream` | ❌ Tidak | Pure OCR, lebih cepat, hemat biaya |
 
 ### `POST /convert`
 
@@ -208,9 +206,31 @@ setelan per request selain tiga override di atas. Satu proses memproses
 `API_MAX_CONCURRENT` PDF sekaligus; sisanya mengantre, supaya request berbarengan
 tidak mengalikan `OCR_CONCURRENCY` ke endpoint OCR.
 
-Direktori kerja tiap request bersifat temporer dan langsung dihapus setelah respons
-disusun: Markdown dan manifest dikirim sebagai nilai, tidak ada file yang dilayani
-dari disk. Yang butuh file crop-nya harus pakai UI atau `run_pipeline` langsung.
+### `POST /convert/ocr` dan `POST /convert/ocr/stream`
+
+**Pure OCR mode** — endpoint ini melewatkan tahap deskripsi gambar (vision LLM)
+sepenuhnya. Gambar tetap dideteksi dan placeholder-nya tetap ada di markdown, tapi
+tidak ada deskripsi yang dihasilkan. Cocok untuk:
+
+- Dokumen tanpa gambar penting (teks murni)
+- Kebutuhan cepat tanpa menunggu vision LLM
+- Menghemat biaya API vision
+
+```bash
+# Pure OCR, langsung dapat markdown
+curl -F file=@paper.pdf http://127.0.0.1:8080/convert/ocr -o paper.md
+
+# Pure OCR dengan progress streaming
+curl -N -F file=@paper.pdf http://127.0.0.1:8080/convert/ocr/stream
+```
+
+Parameter query sama (`dpi`, `cleanup`, `keep_image_link`, `format` untuk yang
+non-stream). Response format juga sama — bedanya hanya tidak ada tahap `vision`
+di progress feed, dan `described` selalu `0`.
+
+Placeholder gambar di output akan berupa `![chart](figures/...)` saja (jika
+`keep_image_link=1`), atau diganti catatan bahwa deskripsi tidak tersedia (jika
+`keep_image_link=0`).
 
 ## Setelan `.env`
 

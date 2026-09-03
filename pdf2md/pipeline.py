@@ -87,9 +87,7 @@ class ProgressTracker:
         self.latest[tick.stage] = tick
         prior = self._stage.get(tick.stage, 0.0)
         self._stage[tick.stage] = max(prior, tick.stage_fraction)
-        total = sum(
-            STAGE_WEIGHTS[key] * value for key, value in self._stage.items()
-        )
+        total = sum(STAGE_WEIGHTS[key] * value for key, value in self._stage.items())
         self._overall = max(self._overall, min(1.0, total))
 
     def complete(self, stage: str) -> None:
@@ -124,7 +122,9 @@ class PipelineResult:
         return [f"{f.link}: {f.error}" for f in self.figures if f.error]
 
 
-def _emit(progress: ProgressFn | None, stage: str, done: int, total: int, message: str = "") -> None:
+def _emit(
+    progress: ProgressFn | None, stage: str, done: int, total: int, message: str = ""
+) -> None:
     if progress:
         progress(Progress(stage, STAGE_LABELS[stage], done, total, message))
 
@@ -134,8 +134,14 @@ def run_pipeline(
     workdir: Path,
     settings: Settings,
     progress: ProgressFn | None = None,
+    describe: bool = True,
 ) -> PipelineResult:
-    """Full PDF -> Markdown run. Artifacts land under `workdir`."""
+    """Full PDF -> Markdown run. Artifacts land under `workdir`.
+
+    When `describe` is False, the vision stage is skipped: figures are still
+    detected and their placeholders remain in the markdown, but no description
+    is generated. This is the "pure OCR" mode.
+    """
     workdir.mkdir(parents=True, exist_ok=True)
     pages_dir = workdir / "pages"
     figures_dir = workdir / "figures"
@@ -145,30 +151,45 @@ def run_pipeline(
     images = pdf_to_images(pdf_path, settings.ocr.dpi, pages_dir)
     if not images:
         raise ValueError(f"{pdf_path.name} tidak punya halaman yang bisa dirender")
-    _emit(progress, "render", len(images), len(images), f"{len(images)} halaman @ {settings.ocr.dpi} DPI")
+    _emit(
+        progress,
+        "render",
+        len(images),
+        len(images),
+        f"{len(images)} halaman @ {settings.ocr.dpi} DPI",
+    )
 
     # --- Stages 1b + 2: OCR and figure description, overlapped ---------------
     # The vision pool is opened BEFORE OCR starts, and run_ocr feeds it each page's
     # crops as they appear. On a document whose figures cluster early, this hides
     # nearly all of the description latency behind the remaining OCR.
-    describer = VisionDescriber(
-        base_url=settings.vision.base_url,
-        api_key=settings.vision.api_key,
-        model=settings.vision.model,
-        timeout=settings.vision.timeout,
-        temperature=settings.vision.temperature,
-        max_tokens=settings.vision.max_tokens,
-        retries=settings.vision.retries,
-    )
-    pool = DescriptionPool(
-        describer,
-        settings.vision.prompt,
-        concurrency=settings.vision.concurrency,
-        progress=lambda done, total, msg: _emit(progress, "vision", done, total, msg),
-    )
+    if describe:
+        describer = VisionDescriber(
+            base_url=settings.vision.base_url,
+            api_key=settings.vision.api_key,
+            model=settings.vision.model,
+            timeout=settings.vision.timeout,
+            temperature=settings.vision.temperature,
+            max_tokens=settings.vision.max_tokens,
+            retries=settings.vision.retries,
+        )
+        pool = DescriptionPool(
+            describer,
+            settings.vision.prompt,
+            concurrency=settings.vision.concurrency,
+            progress=lambda done, total, msg: _emit(
+                progress, "vision", done, total, msg
+            ),
+        )
+        on_figures = pool.submit
+    else:
+        # Pure OCR mode: no vision endpoint, figures stay undescribed.
+        pool = None
+        on_figures = None
 
     _emit(progress, "ocr", 0, len(images), "mengirim halaman ke Unlimited-OCR")
-    _emit(progress, "vision", 0, 0, "menunggu gambar pertama")
+    if describe:
+        _emit(progress, "vision", 0, 0, "menunggu gambar pertama")
     try:
         ocr = run_ocr(
             images,
@@ -182,13 +203,13 @@ def run_pipeline(
             retries=settings.ocr.retries,
             figure_pad=settings.ocr.figure_pad,
             progress=lambda done, total, msg: _emit(progress, "ocr", done, total, msg),
-            on_figures=pool.submit,
+            on_figures=on_figures,
         )
     finally:
         # Workers hold an open HTTP client; drain them even if OCR blew up, or the
         # threads outlive the run and the error surfaces with descriptions still
         # in flight.
-        figures = pool.join()
+        figures = pool.join() if pool else []
 
     if all(page is None for page in ocr.pages):
         raise RuntimeError(
@@ -199,15 +220,16 @@ def run_pipeline(
     described = sum(1 for f in figures if f.description)
     # done/total, not a bare count: a document with no figures must still drive the
     # vision stage to 1.0, and total=0 would read as "no progress" forever.
-    _emit(
-        progress,
-        "vision",
-        len(figures) or 1,
-        len(figures) or 1,
-        f"{described}/{len(figures)} gambar dideskripsikan"
-        if figures
-        else "tidak ada gambar",
-    )
+    if describe:
+        _emit(
+            progress,
+            "vision",
+            len(figures) or 1,
+            len(figures) or 1,
+            f"{described}/{len(figures)} gambar dideskripsikan"
+            if figures
+            else "tidak ada gambar",
+        )
 
     # --- Stage 3: substitute placeholders -----------------------------------
     # A failed page is a marker string, not None, from here on: substitution and
@@ -257,7 +279,9 @@ def run_pipeline(
         f"{report.removed_count} baris header/footer dihapus",
     )
 
-    document = md.collapse_blank_lines(md.PAGE_BREAK.join(p for p in text_pages if p.strip()))
+    document = md.collapse_blank_lines(
+        md.PAGE_BREAK.join(p for p in text_pages if p.strip())
+    )
     (workdir / "output.md").write_text(document, encoding="utf-8")
     # Manifest mirrors ocrpdf's figures.json, plus the description each figure got,
     # so a run can be inspected (or a bad description spotted) after the fact.

@@ -9,6 +9,11 @@ never needs the UI:
 object per line, a `progress` event per pipeline tick (the same per-stage view the
 Streamlit app paints), then a single terminal event carrying the whole Markdown.
 
+`POST /convert/ocr` and `POST /convert/ocr/stream` are the pure-OCR variants: they
+skip the vision LLM stage entirely, so figure placeholders remain in the markdown
+without descriptions. Use these when you don't need figure understanding or want
+faster processing.
+
 Design notes:
 
 * Settings come from `.env` once at import (`Settings.from_env()`), because a
@@ -171,7 +176,9 @@ async def _read_capped(upload: UploadFile) -> bytes:
     return data
 
 
-def _settings_for(dpi: int | None, cleanup: bool | None, keep_image_link: bool | None) -> Settings:
+def _settings_for(
+    dpi: int | None, cleanup: bool | None, keep_image_link: bool | None
+) -> Settings:
     """Env defaults with the per-request overrides layered on top."""
     settings = SETTINGS
     if dpi is not None:
@@ -183,7 +190,9 @@ def _settings_for(dpi: int | None, cleanup: bool | None, keep_image_link: bool |
     return settings
 
 
-def _convert(pdf_bytes: bytes, name: str, settings: Settings) -> PipelineResult:
+def _convert(
+    pdf_bytes: bytes, name: str, settings: Settings, describe: bool = True
+) -> PipelineResult:
     """Blocking half of a request: write the upload, run the pipeline, drop the workdir.
 
     Runs on a worker thread. The result carries the document and the figure
@@ -193,7 +202,7 @@ def _convert(pdf_bytes: bytes, name: str, settings: Settings) -> PipelineResult:
     try:
         pdf = workdir / name
         pdf.write_bytes(pdf_bytes)
-        return run_pipeline(pdf, workdir, settings)
+        return run_pipeline(pdf, workdir, settings, describe=describe)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
@@ -220,7 +229,11 @@ def _outcome(status: int, message: str) -> dict[str, Any]:
 
 
 def _convert_streaming(
-    pdf_bytes: bytes, name: str, settings: Settings, ticks: queue.Queue
+    pdf_bytes: bytes,
+    name: str,
+    settings: Settings,
+    ticks: queue.Queue,
+    describe: bool = True,
 ) -> None:
     """`_convert` plus progress: runs on a plain thread and reports via `ticks`.
 
@@ -232,7 +245,9 @@ def _convert_streaming(
     try:
         pdf = workdir / name
         pdf.write_bytes(pdf_bytes)
-        result = run_pipeline(pdf, workdir, settings, progress=ticks.put)
+        result = run_pipeline(
+            pdf, workdir, settings, progress=ticks.put, describe=describe
+        )
         ticks.put(("done", result))
     except ValueError as exc:
         ticks.put(("error", _outcome(400, str(exc))))
@@ -245,12 +260,16 @@ def _convert_streaming(
 
 
 def _stream_worker(
-    pdf_bytes: bytes, name: str, settings: Settings, ticks: queue.Queue
+    pdf_bytes: bytes,
+    name: str,
+    settings: Settings,
+    ticks: queue.Queue,
+    describe: bool = True,
 ) -> None:
     """Hold a concurrency slot for the whole run, then convert with progress."""
     _stream_slots.acquire()
     try:
-        _convert_streaming(pdf_bytes, name, settings, ticks)
+        _convert_streaming(pdf_bytes, name, settings, ticks, describe)
     finally:
         _stream_slots.release()
 
@@ -295,7 +314,9 @@ def _stages_view(tracker: ProgressTracker, tick: Progress) -> dict[str, Any]:
     }
 
 
-async def _stream_run(pdf_bytes: bytes, name: str, settings: Settings) -> AsyncIterator[str]:
+async def _stream_run(
+    pdf_bytes: bytes, name: str, settings: Settings, describe: bool = True
+) -> AsyncIterator[str]:
     """Drain the worker's queue into an NDJSON feed.
 
     The slot is acquired inside the worker thread (see the module docstring), so
@@ -303,7 +324,9 @@ async def _stream_run(pdf_bytes: bytes, name: str, settings: Settings) -> AsyncI
     """
     ticks: queue.Queue = queue.Queue()
     threading.Thread(
-        target=_stream_worker, args=(pdf_bytes, name, settings, ticks), daemon=True
+        target=_stream_worker,
+        args=(pdf_bytes, name, settings, ticks, describe),
+        daemon=True,
     ).start()
     tracker = ProgressTracker()
     loop = asyncio.get_running_loop()
@@ -322,10 +345,13 @@ async def _stream_run(pdf_bytes: bytes, name: str, settings: Settings) -> AsyncI
         if kind == "error":
             yield json.dumps({"type": "error", **payload}, ensure_ascii=False) + "\n"
             return
-        yield json.dumps(
-            {"type": "result"} | _convert_out(payload, md_name).model_dump(),
-            ensure_ascii=False,
-        ) + "\n"
+        yield (
+            json.dumps(
+                {"type": "result"} | _convert_out(payload, md_name).model_dump(),
+                ensure_ascii=False,
+            )
+            + "\n"
+        )
         return
 
 
@@ -334,8 +360,15 @@ def health() -> dict:
     """Liveness plus the effective model config. Never echoes an API key."""
     return {
         "status": "ok",
-        "ocr": {"base_url": SETTINGS.ocr.base_url, "model": SETTINGS.ocr.model, "dpi": SETTINGS.ocr.dpi},
-        "vision": {"base_url": SETTINGS.vision.base_url, "model": SETTINGS.vision.model},
+        "ocr": {
+            "base_url": SETTINGS.ocr.base_url,
+            "model": SETTINGS.ocr.model,
+            "dpi": SETTINGS.ocr.dpi,
+        },
+        "vision": {
+            "base_url": SETTINGS.vision.base_url,
+            "model": SETTINGS.vision.model,
+        },
         "cleanup_enabled": SETTINGS.cleanup.enabled,
         "keep_image_link": SETTINGS.keep_image_link,
         "auth_required": bool(API.api_key),
@@ -409,7 +442,9 @@ async def convert(
     dependencies=[Depends(require_key)],
     response_model=None,
     response_class=StreamingResponse,
-    responses={200: {"content": {"application/x-ndjson": {"schema": {"type": "string"}}}}},
+    responses={
+        200: {"content": {"application/x-ndjson": {"schema": {"type": "string"}}}}
+    },
 )
 async def convert_stream(
     file: Annotated[UploadFile, File(description="PDF yang mau dikonversi")],
@@ -434,5 +469,93 @@ async def convert_stream(
         _stream_run(pdf_bytes, name, settings),
         media_type="application/x-ndjson",
         # The feed is live; buffering proxies must not sit on it.
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.post(
+    "/convert/ocr",
+    dependencies=[Depends(require_key)],
+    response_model=None,
+    responses={
+        200: {
+            "content": {
+                "text/markdown": {"schema": {"type": "string"}},
+                "application/json": {"schema": ConvertOut.model_json_schema()},
+            }
+        }
+    },
+)
+async def convert_ocr_only(
+    file: Annotated[UploadFile, File(description="PDF yang mau dikonversi")],
+    format: Annotated[str, Query(pattern="^(md|json)$")] = "md",
+    dpi: Annotated[int | None, Query(ge=72, le=600)] = None,
+    cleanup: Annotated[bool | None, Query()] = None,
+    keep_image_link: Annotated[bool | None, Query()] = None,
+) -> Response:
+    """Pure OCR mode: PDF in, Markdown out, without vision LLM descriptions.
+
+    Same as `/convert` but skips the figure description stage. Figures are still
+    detected and their placeholders remain in the markdown (or are replaced with
+    a note that description was skipped, depending on `keep_image_link`).
+    """
+    pdf_bytes = await _read_capped(file)
+    name = _safe_pdf_name(file.filename)
+    settings = _settings_for(dpi, cleanup, keep_image_link)
+
+    try:
+        result = await anyio.to_thread.run_sync(
+            _convert, pdf_bytes, name, settings, describe=False, limiter=_slots
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    md_name = f"{Path(name).stem}.md"
+    if format == "json":
+        return JSONResponse(_convert_out(result, md_name).model_dump())
+
+    return Response(
+        content=result.markdown.encode("utf-8"),
+        media_type="text/markdown; charset=utf-8",
+        headers={
+            "Content-Disposition": _content_disposition(md_name),
+            "X-Pdf2md-Pages": str(result.page_count),
+            "X-Pdf2md-Figures": str(len(result.figures)),
+            "X-Pdf2md-Described": str(result.described),
+            "X-Pdf2md-Substituted": str(result.substituted),
+            "X-Pdf2md-Chrome-Removed": str(result.cleanup.removed_count),
+            "X-Pdf2md-Page-Failures": str(len(result.failures)),
+        },
+    )
+
+
+@app.post(
+    "/convert/ocr/stream",
+    dependencies=[Depends(require_key)],
+    response_model=None,
+    response_class=StreamingResponse,
+    responses={
+        200: {"content": {"application/x-ndjson": {"schema": {"type": "string"}}}}
+    },
+)
+async def convert_ocr_only_stream(
+    file: Annotated[UploadFile, File(description="PDF yang mau dikonversi")],
+    dpi: Annotated[int | None, Query(ge=72, le=600)] = None,
+    cleanup: Annotated[bool | None, Query()] = None,
+    keep_image_link: Annotated[bool | None, Query()] = None,
+) -> StreamingResponse:
+    """Pure OCR mode with live progress: PDF in, NDJSON feed out.
+
+    Same as `/convert/stream` but skips the vision stage. The `vision` stage in
+    progress events will show as pending (never started).
+    """
+    pdf_bytes = await _read_capped(file)
+    name = _safe_pdf_name(file.filename)
+    settings = _settings_for(dpi, cleanup, keep_image_link)
+    return StreamingResponse(
+        _stream_run(pdf_bytes, name, settings, describe=False),
+        media_type="application/x-ndjson",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
