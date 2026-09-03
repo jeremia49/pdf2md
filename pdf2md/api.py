@@ -43,6 +43,7 @@ import queue
 import re
 import secrets
 import shutil
+import functools
 import tempfile
 import threading
 from collections.abc import AsyncIterator
@@ -505,7 +506,7 @@ async def convert_ocr_only(
 
     try:
         result = await anyio.to_thread.run_sync(
-            _convert, pdf_bytes, name, settings, describe=False, limiter=_slots
+            functools.partial(_convert, pdf_bytes, name, settings, describe=False), limiter=_slots
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
